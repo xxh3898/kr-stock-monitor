@@ -1,0 +1,11 @@
+{
+  "version": "0.2.0",
+  "configurations": [{
+    "name": "KR Stock Monitor 개발 호스트",
+    "type": "extensionHost",
+    "request": "launch",
+    "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+    "outFiles": ["${workspaceFolder}/out/**/*.js"],
+    "preLaunchTask": "npm: compile"
+  }]
+}

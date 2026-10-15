@@ -1,0 +1,68 @@
+{
+  "name": "kr-stock-monitor",
+  "displayName": "KR Stock Monitor",
+  "description": "한국투자증권 KRX 실시간 체결 시세를 상태 표시줄에서 확인합니다.",
+  "version": "0.1.1",
+  "publisher": "xxh3898",
+  "license": "UNLICENSED",
+  "repository": { "type": "git", "url": "https://github.com/xxh3898/kr-stock-monitor.git" },
+  "engines": { "vscode": "^1.140.0" },
+  "categories": ["Other"],
+  "extensionKind": ["ui"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/src/extension.js",
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "test": "npm run compile && node --test out/test/*.test.js",
+    "vscode:prepublish": "npm run compile",
+    "package": "vsce package --skip-license --out kr-stock-monitor-0.1.1.vsix"
+  },
+  "dependencies": { "ws": "8.22.0" },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@types/vscode": "1.140.0",
+    "@types/ws": "8.18.2",
+    "@vscode/vsce": "4.0.0",
+    "typescript": "7.0.2"
+  },
+  "contributes": {
+    "commands": [
+      { "command": "krStockMonitor.menu", "title": "메뉴", "category": "KR Stock Monitor" },
+      { "command": "krStockMonitor.connect", "title": "실전 KRX 시세 연결", "category": "KR Stock Monitor" },
+      { "command": "krStockMonitor.disconnect", "title": "연결 끊기", "category": "KR Stock Monitor" },
+      { "command": "krStockMonitor.registerKeys", "title": "실전 API 키 등록", "category": "KR Stock Monitor" },
+      { "command": "krStockMonitor.removeKeys", "title": "API 키 삭제", "category": "KR Stock Monitor" },
+      { "command": "krStockMonitor.addStock", "title": "관심 종목 추가", "category": "KR Stock Monitor" },
+      { "command": "krStockMonitor.removeStock", "title": "관심 종목 삭제", "category": "KR Stock Monitor" },
+      { "command": "krStockMonitor.demo", "title": "가상 시세 데모 시작", "category": "KR Stock Monitor" },
+      { "command": "krStockMonitor.displayMode", "title": "표시 방식 선택", "category": "KR Stock Monitor" },
+      { "command": "krStockMonitor.showLogs", "title": "연결 로그 보기", "category": "KR Stock Monitor" }
+    ],
+    "configuration": {
+      "title": "KR Stock Monitor",
+      "properties": {
+        "krStockMonitor.stocks": {
+          "type": "array", "scope": "application", "default": [],
+          "description": "KRX 관심 종목. API 키는 설정 파일에 입력하지 마세요.",
+          "items": {
+            "type": "object", "required": ["code", "name"], "additionalProperties": false,
+            "properties": {
+              "code": { "type": "string", "pattern": "^[0-9]{6}$", "description": "6자리 종목 코드" },
+              "name": { "type": "string", "minLength": 1, "maxLength": 40, "description": "표시 이름" }
+            }
+          }
+        },
+        "krStockMonitor.displayMode": {
+          "type": "string", "scope": "application", "default": "all", "enum": ["all", "rotate"],
+          "enumDescriptions": ["모든 관심 종목을 동시에 표시합니다.", "한 종목씩 순서대로 표시합니다."],
+          "description": "상태 표시줄의 종목 표시 방식. 메뉴의 표시 방식 선택에서도 변경할 수 있습니다."
+        },
+        "krStockMonitor.rotationInterval": {
+          "type": "integer", "scope": "application", "default": 5, "minimum": 1, "maximum": 60,
+          "description": "순환 표시(rotate)에서만 적용하는 간격(초). 시세는 체결 수신 즉시 갱신합니다."
+        }
+      }
+    }
+  }
+}
