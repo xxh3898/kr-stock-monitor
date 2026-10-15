@@ -19,6 +19,8 @@ function environment(initial: Record<string, unknown> = {}) {
   let stops = 0;
   let passwords = true;
   let failStore = false;
+  let confirmDelete = false;
+  const intervals: number[] = [];
   let quoteListener: (quote: Quote) => void = () => {};
   const configuration: Record<string, unknown> = { stocks: [{ code: '204320', name: 'HL만도' }], rotationInterval: 5, ...initial };
   const change = (key = 'stocks') => configListener({ affectsConfiguration: (section: string) => section === 'krStockMonitor' || section === `krStockMonitor.${key}` });
@@ -41,7 +43,7 @@ function environment(initial: Record<string, unknown> = {}) {
       showInputBox: async (options: { password?: boolean; title: string }) => { if (options.title.includes('APP')) passwords &&= options.password === true; return inputs.shift(); },
       showInformationMessage: (text: string) => { notices.push(text); },
       showErrorMessage: (text: string) => { notices.push(text); },
-      showWarningMessage: async () => undefined,
+      showWarningMessage: async () => confirmDelete ? '삭제' : undefined,
       showQuickPick: async (options: { label: string }[]) => { const label = picks.shift(); return options.find(option => option.label === label); }
     },
     commands: {
@@ -53,12 +55,17 @@ function environment(initial: Record<string, unknown> = {}) {
       onDidChangeConfiguration: (listener: typeof configListener) => { configListener = listener; return disposable; }
     }
   };
-  const kis = { createClient: (keys: () => Promise<unknown>, state: (value: State) => void, quote: (value: Quote) => void) => {
+  const kis = { createClient: (state: (value: State) => void, quote: (value: Quote) => void) => {
     quoteListener = quote;
     return {
-    start() { starts++; void keys().then(value => state({ kind: value ? 'waiting' : 'keys', message: value ? '체결 대기' : '실전 API 키 등록 필요' })); },
-    stop() { stops++; state({ kind: 'idle', message: '연결 안 됨' }); }
-  }; } };
+      start(_stocks: unknown, seconds: number) {
+        starts++; intervals.push(seconds);
+        void Promise.resolve().then(() => state({ kind: secrets.has('kis.real.credentials.v1') ? 'live' : 'keys', message: secrets.has('kis.real.credentials.v1') ? 'HTTPS 주기 조회' : '실전 API 키 등록 필요' }));
+      },
+      updateInterval(seconds: number) { intervals.push(seconds); },
+      stop() { stops++; state({ kind: 'idle', message: '연결 안 됨' }); }
+    };
+  } };
   const Module = require('node:module') as { _load: (id: string, ...args: any[]) => any };
   const load = Module._load;
   const path = require.resolve('../src/extension');
@@ -75,7 +82,7 @@ function environment(initial: Record<string, unknown> = {}) {
     run: async (id: string) => { await commands.get(`krStockMonitor.${id}`)!(); await new Promise<void>(resolve => setImmediate(resolve)); },
     dispose: () => { extension.deactivate(); for (const item of context.subscriptions) item.dispose(); },
     starts: () => starts, stops: () => stops, passwords: () => passwords, failStore: () => { failStore = true; },
-    change, quote: (value: Quote) => quoteListener(value) };
+    secretChanged: (key: string) => secretListener({ key }), intervals, confirmDeletion: () => { confirmDelete = true; }, change, quote: (value: Quote) => quoteListener(value) };
 }
 
 test('activation is offline and demo is explicit; switching to real clears simulated prices', async () => {
@@ -126,9 +133,9 @@ test('all mode displays every stock, keeps pending symbols and updates each quot
   try {
     assert.ok(h.bar.text.includes('DB하이텍 시세 대기 | HL만도 시세 대기 | 셀바스AI 시세 대기'));
     await h.run('connect');
-    h.quote({ code: '204320', price: 45000, changeRate: 1.25, tradeDate: '20261015', tradeTime: '10:15:30', receivedAt: 123 });
+    h.quote({ code: '204320', price: 45000, changeRate: 1.25, receivedAt: 123 });
     assert.ok(h.bar.text.includes('DB하이텍 시세 대기 | HL만도 45,000원 (+1.25%) | 셀바스AI 시세 대기'));
-    assert.ok(h.bar.tooltip.includes('20261015 10:15:30'));
+    assert.ok(h.bar.tooltip.includes('마지막 조회')); assert.ok(h.bar.tooltip.includes('실제 체결 시각이 아닙니다'));
     const text = h.bar.text;
     h.picks.push('표시 방식 선택', undefined); await h.run('menu');
     assert.equal(h.bar.text, text); assert.equal(h.starts(), 1);
@@ -140,7 +147,7 @@ test('both modes are reachable; rotation uses its interval and switching keeps l
   const h = environment({ stocks: threeStocks });
   try {
     await h.run('connect');
-    h.quote({ code: '204320', price: 45000, changeRate: 1.25, tradeDate: '20261015', tradeTime: '10:15:30', receivedAt: 123 });
+    h.quote({ code: '204320', price: 45000, changeRate: 1.25, receivedAt: 123 });
     h.picks.push('표시 방식 선택', '순환 표시'); await h.run('menu');
     assert.equal(h.configuration.displayMode, 'rotate');
     assert.ok(h.bar.text.includes('DB하이텍')); assert.ok(!h.bar.text.includes('HL만도'));
@@ -180,4 +187,44 @@ test('zero and one stock work in both modes without an unnecessary rotation time
     }
   }
   assert.equal(interval.mock.callCount(), 0);
+});
+
+test('existing credentials and all/rotate settings survive activation and HTTPS uses the selected polling interval', async () => {
+  for (const displayMode of ['all', 'rotate']) {
+    const h = environment({ stocks: threeStocks, displayMode, rotationInterval: 7, pollingInterval: 10 });
+    const old = JSON.stringify({ appKey: 'synthetic-existing-key', appSecret: 'synthetic-existing-secret' });
+    h.secrets.set('kis.real.credentials.v1', old);
+    try {
+      await h.run('connect'); assert.deepEqual(h.intervals, [10]);
+      assert.equal(h.secrets.get('kis.real.credentials.v1'), old);
+      assert.deepEqual(h.configuration.stocks, threeStocks); assert.equal(h.configuration.displayMode, displayMode);
+      assert.equal(h.configuration.rotationInterval, 7); assert.ok(h.bar.text.startsWith('[KRX · HTTPS]'));
+      h.configuration.pollingInterval = 15; h.change('pollingInterval');
+      assert.deepEqual(h.intervals, [10, 15]); assert.equal(h.starts(), 1);
+      h.configuration.pollingInterval = 4; h.change('pollingInterval'); assert.match(h.bar.text, /5~300초/);
+    } finally { h.dispose(); }
+  }
+});
+
+test('deleting keys also removes derived token cache without changing watchlist or display settings', async () => {
+  const h = environment({ stocks: threeStocks, displayMode: 'rotate', rotationInterval: 7 });
+  try {
+    h.secrets.set('kis.real.credentials.v1', 'synthetic-credentials'); h.secrets.set('kis.real.restToken.v1', 'synthetic-token-cache');
+    await h.run('removeKeys'); assert.equal(h.secrets.size, 2);
+    h.confirmDeletion(); await h.run('removeKeys'); assert.equal(h.secrets.size, 0);
+    assert.deepEqual(h.configuration.stocks, threeStocks); assert.equal(h.configuration.displayMode, 'rotate'); assert.equal(h.configuration.rotationInterval, 7);
+  } finally { h.dispose(); }
+});
+
+test('derived token cache changes do not disconnect but original credential changes clear the derived cache', async () => {
+  const h = environment();
+  try {
+    await h.run('connect'); const stops = h.stops();
+    h.secrets.set('kis.real.restToken.v1', 'synthetic-cache');
+    h.secretChanged('kis.real.restToken.v1'); await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(h.stops(), stops);
+    // Exercise the original credential event path through key registration.
+    h.inputs.push('synthetic-key', 'synthetic-secret'); await h.run('registerKeys');
+    assert.ok(h.stops() > stops); assert.equal(h.secrets.has('kis.real.restToken.v1'), false);
+  } finally { h.dispose(); }
 });

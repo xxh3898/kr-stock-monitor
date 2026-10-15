@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { createClient, Credentials, KisClient, State } from './kisClient';
+import { KisTokenProvider } from './kisToken';
 import { formatQuote, Quote, Stock, validateStocks } from './quote';
 
 const SECRET_KEY = 'kis.real.credentials.v1';
@@ -10,11 +11,13 @@ class Monitor implements vscode.Disposable {
   private readonly bar = vscode.window.createStatusBarItem('kr-stock-monitor', vscode.StatusBarAlignment.Right, 0);
   private readonly output = vscode.window.createOutputChannel('KR Stock Monitor');
   private readonly client: KisClient;
+  private readonly tokens: KisTokenProvider;
   private readonly quotes = new Map<string, Quote>();
   private stocks: Stock[] = [];
   private state: State = { kind: 'idle', message: '연결 안 됨' };
   private mode: 'idle' | 'real' | 'demo' = 'idle';
   private displayMode: 'all' | 'rotate' = 'all';
+  private pollingInterval = 5;
   private rotation?: ReturnType<typeof setInterval>;
   private demoTimer?: ReturnType<typeof setInterval>;
   private selected = 0;
@@ -23,12 +26,13 @@ class Monitor implements vscode.Disposable {
   constructor(private readonly context: vscode.ExtensionContext) {
     this.bar.name = 'KR Stock Monitor';
     this.bar.command = `${PREFIX}.menu`;
-    this.client = createClient(() => this.readKeys(), state => {
+    this.tokens = new KisTokenProvider(() => this.readKeys(), context.secrets);
+    this.client = createClient(state => {
       if (this.disposed) return;
       if (this.state.message !== state.message) this.output.appendLine(`${new Date().toISOString()} ${state.message}`);
       this.state = state;
       this.render();
-    }, quote => { if (!this.disposed) { this.quotes.set(quote.code, quote); this.render(); } });
+    }, quote => { if (!this.disposed) { this.quotes.set(quote.code, quote); this.render(); } }, this.tokens);
     const commands: Record<string, () => unknown> = {
       menu: () => this.menu(), connect: () => this.connect(), disconnect: () => this.disconnect(),
       registerKeys: () => this.registerKeys(), removeKeys: () => this.removeKeys(),
@@ -42,7 +46,12 @@ class Monitor implements vscode.Disposable {
     }
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
       if (!event.affectsConfiguration(PREFIX)) return;
-      if (!event.affectsConfiguration(`${PREFIX}.stocks`)) { this.configure(); return; }
+      if (!event.affectsConfiguration(`${PREFIX}.stocks`)) {
+        if (this.configure() && this.mode === 'real' && event.affectsConfiguration(`${PREFIX}.pollingInterval`)) {
+          this.client.updateInterval(this.pollingInterval);
+        }
+        return;
+      }
       const previousMode = this.mode;
       this.disconnect();
       this.quotes.clear();
@@ -52,7 +61,11 @@ class Monitor implements vscode.Disposable {
       }
     }));
     context.subscriptions.push(context.secrets.onDidChange(event => {
-      if (event.key === SECRET_KEY && this.mode === 'real') this.disconnect();
+      if (event.key !== SECRET_KEY) return;
+      if (this.mode === 'real') this.disconnect();
+      void this.tokens.clear().catch(() => {
+        if (!this.disposed) void vscode.window.showErrorMessage('파생 토큰 캐시를 삭제하지 못했습니다. 보안 저장소를 확인하세요.');
+      });
     }));
     this.configure();
   }
@@ -63,6 +76,9 @@ class Monitor implements vscode.Disposable {
     try {
       const config = vscode.workspace.getConfiguration(PREFIX);
       this.stocks = validateStocks(config.get('stocks', []));
+      const pollingInterval = config.get<number>('pollingInterval', 5);
+      if (!Number.isInteger(pollingInterval) || pollingInterval < 5 || pollingInterval > 300) throw new Error('조회 간격은 5~300초 정수로 설정하세요.');
+      this.pollingInterval = pollingInterval;
       const displayMode = config.get<string>('displayMode', 'all');
       if (displayMode !== 'all' && displayMode !== 'rotate') throw new Error('표시 방식은 all 또는 rotate로 설정하세요.');
       this.displayMode = displayMode;
@@ -102,8 +118,9 @@ class Monitor implements vscode.Disposable {
     const appSecret = await vscode.window.showInputBox({ ...options, title: '한국투자 실전 APP SECRET', prompt: '채팅·settings.json에 입력하지 마세요.' });
     if (!appSecret?.trim() || this.disposed) return;
     this.disconnect();
+    await this.tokens.clear();
     await this.context.secrets.store(SECRET_KEY, JSON.stringify({ appKey: appKey.trim(), appSecret: appSecret.trim() }));
-    if (!this.disposed) void vscode.window.showInformationMessage('실전 API 키를 저장했습니다. KR Stock Monitor: 실전 KRX 시세 연결을 실행하세요.');
+    if (!this.disposed) void vscode.window.showInformationMessage('실전 API 키를 저장했습니다. KR Stock Monitor: HTTPS KRX 시세 조회 시작을 실행하세요.');
   }
 
   private async removeKeys(): Promise<void> {
@@ -111,6 +128,7 @@ class Monitor implements vscode.Disposable {
     if (answer !== '삭제' || this.disposed) return;
     this.disconnect();
     await this.context.secrets.delete(SECRET_KEY);
+    await this.tokens.clear();
     void vscode.window.showInformationMessage('등록한 키를 삭제했습니다.');
   }
 
@@ -121,7 +139,7 @@ class Monitor implements vscode.Disposable {
     this.mode = 'real';
     // Demo values must never be reused as live prices.
     this.quotes.clear();
-    this.client.start(this.stocks);
+    this.client.start(this.stocks, this.pollingInterval);
   }
 
   private disconnect(): void {
@@ -142,10 +160,8 @@ class Monitor implements vscode.Disposable {
     this.mode = 'demo';
     let tick = 0;
     const update = (): void => {
-      const date = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()).replaceAll('-', '');
-      const time = new Date().toLocaleTimeString('en-GB', { timeZone: 'Asia/Seoul', hour12: false });
       this.stocks.forEach((stock, index) => this.quotes.set(stock.code, { code: stock.code, price: 10_000 + index * 1000 + tick * 10,
-        changeRate: ((tick % 7) - 3) / 10, tradeTime: time, tradeDate: date, receivedAt: Date.now() }));
+        changeRate: ((tick % 7) - 3) / 10, receivedAt: Date.now() }));
       tick++;
       this.state = { kind: 'live', message: '데모 · 가상 데이터' };
       this.render();
@@ -182,10 +198,10 @@ class Monitor implements vscode.Disposable {
 
   private async menu(): Promise<void> {
     const options: { label: string; description?: string; command?: string; index?: number }[] = this.displayMode === 'rotate' ? this.stocks.map((stock, index) => ({
-      label: stock.name, description: `${stock.code} · ${this.quotes.has(stock.code) ? formatQuote(this.quotes.get(stock.code)!) : '체결 대기'}`, index
+      label: stock.name, description: `${stock.code} · ${this.quotes.has(stock.code) ? formatQuote(this.quotes.get(stock.code)!) : '조회 대기'}`, index
     })) : [];
     options.push(...[
-      ['실전 KRX 시세 연결', 'connect'], ['연결 끊기', 'disconnect'], ['실전 API 키 등록', 'registerKeys'],
+      ['HTTPS KRX 시세 조회 시작', 'connect'], ['연결 끊기', 'disconnect'], ['실전 API 키 등록', 'registerKeys'],
       ['관심 종목 추가', 'addStock'], ['관심 종목 삭제', 'removeStock'], ['표시 방식 선택', 'displayMode'], ['가상 시세 데모', 'demo'], ['연결 로그 보기', 'showLogs']
     ].map(([label, command]) => ({ label, command: `${PREFIX}.${command}` })));
     const picked = await vscode.window.showQuickPick(options, { title: `KR Stock Monitor · ${this.state.message}` });
@@ -201,16 +217,16 @@ class Monitor implements vscode.Disposable {
       const quote = this.quotes.get(stock.code);
       return `${stock.name} ${quote ? formatQuote(quote) : '시세 대기'}`;
     }).join(' | ');
-    const prefix = this.mode === 'demo' ? '[데모] ' : '[KRX] ';
+    const prefix = this.mode === 'demo' ? '[데모] ' : '[KRX · HTTPS] ';
     const status = this.state.kind === 'live' && this.mode === 'real' ? '' : ` · ${this.state.message}`;
     this.bar.text = text ? `${prefix}${text}${status}` : `KR Stock · ${this.state.kind === 'error' ? this.state.message : '관심 종목 추가'}`;
     const rows = this.stocks.map(item => {
       const q = this.quotes.get(item.code);
-      const time = q ? new Date(q.receivedAt).toLocaleTimeString('en-GB', { timeZone: 'Asia/Seoul', hour12: false }) : '';
-      return `${item.name} (${item.code}) ${q ? `${formatQuote(q)}\n  체결 ${q.tradeDate} ${q.tradeTime} · 수신 ${time} KST` : '체결 대기'}`;
+      const time = q ? new Date(q.receivedAt).toLocaleString('sv-SE', { timeZone: 'Asia/Seoul', hour12: false }) : '';
+      return `${item.name} (${item.code}) ${q ? `${formatQuote(q)}\n  마지막 ${this.mode === 'demo' ? '가상 갱신' : '조회'} ${time} KST` : '조회 대기'}`;
     });
-    this.bar.tooltip = [`${this.mode === 'demo' ? '데모 가상 시세' : '한국투자증권 · 실전 KRX'}`, this.state.message,
-      ...rows, '가격은 마지막 수신 체결가입니다. 장외·무체결 시 갱신되지 않습니다.', '클릭: 종목 및 연결 메뉴'].join('\n');
+    this.bar.tooltip = [`${this.mode === 'demo' ? '데모 가상 시세' : '한국투자증권 · 실전 KRX · HTTPS'}`, this.state.message,
+      ...rows, '가격은 마지막 조회 결과이며 조회 시각은 실제 체결 시각이 아닙니다.', '클릭: 종목 및 연결 메뉴'].join('\n');
     this.bar.show();
   }
 

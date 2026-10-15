@@ -1,220 +1,155 @@
-import WebSocket from 'ws';
-import { parseFrame, Quote, Stock } from './quote';
+import { parseQuote, Quote, Stock } from './quote';
+import { BASE_URL, KisError, KisTokenProvider, requestJson, Session } from './kisToken';
+export type { Credentials } from './kisToken';
 
-export interface Credentials { appKey: string; appSecret: string }
-export type State = { kind: 'idle' | 'keys' | 'connecting' | 'subscribing' | 'waiting' | 'live' | 'retry' | 'error'; message: string };
-export interface Socket {
-  readyState: number;
-  on(event: string, listener: (...args: any[]) => void): unknown;
-  send(data: string, callback?: (error?: Error) => void): void;
-  pong(data: string): void;
-  close(): void;
-  terminate(): void;
-}
+export type State = { kind: 'idle' | 'keys' | 'connecting' | 'waiting' | 'live' | 'retry' | 'error'; message: string };
 export interface Dependencies {
-  credentials(): Promise<Credentials | undefined>;
-  approval(credentials: Credentials, signal: AbortSignal): Promise<string>;
-  socket(): Socket;
+  session(signal: AbortSignal): Promise<Session | undefined>;
+  invalidate(token: string): Promise<void>;
+  request(stock: Stock, session: Session, signal: AbortSignal): Promise<Quote>;
   schedule(callback: () => void, delay: number): unknown;
   cancel(handle: unknown): void;
+  now(): number;
 }
 
-class ApprovalError extends Error {
-  constructor(readonly retryable: boolean, message: string) { super(message); }
-}
-
-export async function requestApproval(credentials: Credentials, signal: AbortSignal): Promise<string> {
-  let response: Response;
-  try {
-    response = await fetch('https://openapi.koreainvestment.com:9443/oauth2/Approval', {
-      method: 'POST', redirect: 'error',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ grant_type: 'client_credentials', appkey: credentials.appKey, secretkey: credentials.appSecret }),
-      signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)])
-    });
-  } catch {
-    throw new ApprovalError(true, '접속키 발급 서버 연결 실패');
-  }
-  if (!response.ok) {
-    await response.body?.cancel();
-    throw new ApprovalError(false, `접속키 발급 실패 (HTTP ${response.status}). 키·이용 권한을 확인한 뒤 다시 연결하세요.`);
-  }
-  let data: unknown;
-  try { data = await response.json(); } catch { throw new ApprovalError(false, '접속키 발급 응답 형식 오류'); }
-  const key = (data as { approval_key?: unknown } | null)?.approval_key;
-  if (typeof key !== 'string' || !key || key.length > 4096) throw new ApprovalError(false, '접속키 발급 응답에 키가 없습니다.');
-  return key;
+export async function requestQuote(stock: Stock, session: Session, signal: AbortSignal): Promise<Quote> {
+  if (!/^\d{6}$/.test(stock.code)) throw new KisError('fatal', '종목 코드 형식 오류');
+  const url = new URL(`${BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price`);
+  url.searchParams.set('FID_COND_MRKT_DIV_CODE', 'J');
+  url.searchParams.set('FID_INPUT_ISCD', stock.code);
+  const data = await requestJson(url.toString(), { method: 'GET', headers: {
+    'content-type': 'application/json', authorization: `Bearer ${session.token}`,
+    appkey: session.credentials.appKey, appsecret: session.credentials.appSecret, tr_id: 'FHKST01010100', custtype: 'P'
+  } }, signal);
+  try { return parseQuote(data, stock.code); }
+  catch { throw new KisError('fatal', '현재가 응답 형식 오류'); }
 }
 
 export class KisClient {
   private generation = 0;
   private running = false;
-  private transport?: Socket;
   private abort?: AbortController;
-  private retryTimer?: unknown;
-  private subscribeTimer?: unknown;
-  private activityTimer?: unknown;
-  private retryAttempt = 0;
-  private approvalKey?: string;
+  private timer?: unknown;
+  private wait?: { handle: unknown; resolve(value: boolean): void };
+  private nextKind?: 'poll' | 'retry';
+  private interval = 5000;
+  private cycleStarted = 0;
+  private lastRequestAt = -Infinity;
+  private failures = 0;
+  private recoveringAuth = false;
   private stocks: Stock[] = [];
-  private accepted = new Set<string>();
-  private pending?: string;
-  private nextIndex = 0;
 
   constructor(private readonly state: (state: State) => void, private readonly quote: (quote: Quote) => void,
     private readonly deps: Dependencies) {}
 
-  start(stocks: Stock[]): void {
+  start(stocks: Stock[], interval = 5): void {
     this.stop();
     if (!stocks.length) { this.state({ kind: 'idle', message: '관심 종목을 추가하세요' }); return; }
     this.stocks = stocks;
+    this.interval = interval * 1000;
     this.running = true;
-    void this.connect(this.generation);
+    this.abort = new AbortController();
+    void this.cycle(this.generation);
+  }
+
+  updateInterval(seconds: number): void {
+    this.interval = seconds * 1000;
+    if (this.running && this.nextKind === 'poll') {
+      if (this.timer !== undefined) this.deps.cancel(this.timer);
+      this.schedule(this.generation, Math.max(0, this.cycleStarted + this.interval - this.deps.now()), 'poll');
+      this.state({ kind: 'live', message: `HTTPS ${seconds}초 주기 조회` });
+    }
   }
 
   stop(): void {
     this.running = false;
     this.generation++;
-    this.abort?.abort();
-    this.clearTimers();
-    const socket = this.transport;
-    this.transport = undefined;
-    if (socket?.readyState === WebSocket.OPEN) {
-      for (const code of this.accepted) {
-        try { socket.send(this.subscription(code, '2')); } catch { /* Closing releases the subscriptions. */ }
-      }
-      socket.close();
-    } else { socket?.terminate(); }
-    this.approvalKey = undefined;
-    this.accepted.clear();
-    this.pending = undefined;
-    this.retryAttempt = 0;
+    this.abort?.abort(); this.abort = undefined;
+    if (this.timer !== undefined) this.deps.cancel(this.timer);
+    this.timer = this.nextKind = undefined;
+    if (this.wait) { this.deps.cancel(this.wait.handle); this.wait.resolve(false); this.wait = undefined; }
+    this.failures = 0; this.recoveringAuth = false;
     this.state({ kind: 'idle', message: '연결 안 됨' });
   }
 
-  private active(generation: number): boolean { return this.running && this.generation === generation; }
+  private active(generation: number): boolean { return this.running && generation === this.generation; }
 
-  private clearTimers(): void {
-    for (const timer of [this.retryTimer, this.subscribeTimer, this.activityTimer]) {
-      if (timer !== undefined) this.deps.cancel(timer);
-    }
-    this.retryTimer = this.subscribeTimer = this.activityTimer = undefined;
-  }
-
-  private subscription(code: string, type: '1' | '2'): string {
-    return JSON.stringify({ header: { approval_key: this.approvalKey, custtype: 'P', tr_type: type, 'content-type': 'utf-8' },
-      body: { input: { tr_id: 'H0STCNT0', tr_key: code } } });
-  }
-
-  private async connect(generation: number): Promise<void> {
-    this.state({ kind: 'connecting', message: '실전 KRX 연결 중' });
-    this.abort = new AbortController();
-    try {
-      if (!this.approvalKey) {
-        const credentials = await this.deps.credentials();
-        if (!this.active(generation)) return;
-        if (!credentials) {
-          this.running = false;
-          this.state({ kind: 'keys', message: '실전 API 키 등록 필요' });
-          return;
-        }
-        const key = await this.deps.approval(credentials, this.abort.signal);
-        if (!this.active(generation)) return;
-        this.approvalKey = key;
-      }
-      const socket = this.deps.socket();
-      this.transport = socket;
-      let failed = false;
-      let receivedQuote = false;
-      const fail = (message: string, retryable: boolean): void => {
-        if (failed || !this.active(generation) || this.transport !== socket) return;
-        failed = true;
-        this.failure(generation, message, retryable);
-      };
-      const touch = (): void => {
-        if (this.activityTimer !== undefined) this.deps.cancel(this.activityTimer);
-        // Detect silent disconnects from all transport activity, not from absent trades.
-        this.activityTimer = this.deps.schedule(() => fail('연결 응답 없음', true), 90_000);
-      };
-      const sendNext = (): void => {
-        if (!this.active(generation) || this.transport !== socket || failed) return;
-        const stock = this.stocks[this.nextIndex++];
-        if (!stock) {
-          if (!receivedQuote) this.state({ kind: 'waiting', message: `KRX 구독 ${this.accepted.size}종목 · 체결 대기` });
-          return;
-        }
-        this.pending = stock.code;
-        this.state({ kind: 'subscribing', message: `KRX 구독 승인 대기 ${stock.code}` });
-        this.subscribeTimer = this.deps.schedule(() => fail('종목 구독 승인 시간 초과', true), 10_000);
-        try { socket.send(this.subscription(stock.code, '1'), error => { if (error) fail('구독 전송 실패', true); }); }
-        catch { fail('구독 전송 실패', true); }
-      };
-      socket.on('open', () => {
-        if (!this.active(generation) || this.transport !== socket) return;
-        this.accepted.clear(); this.pending = undefined; this.nextIndex = 0;
-        touch(); sendNext();
-      });
-      socket.on('message', (data: { toString(): string }) => {
-        if (!this.active(generation) || this.transport !== socket || failed) return;
-        try {
-          touch();
-          const raw = data.toString();
-          const frame = parseFrame(raw);
-          if (frame.type === 'ping') { socket.pong(raw); }
-          else if (frame.type === 'rejected') { fail(`KRX 구독 거절 (${frame.errorCode}). 키·종목·동시 접속을 확인하세요.`, false); }
-          else if (frame.type === 'ack' && frame.code === this.pending) {
-            if (this.subscribeTimer !== undefined) this.deps.cancel(this.subscribeTimer);
-            this.accepted.add(frame.code); this.pending = undefined;
-            this.subscribeTimer = this.deps.schedule(sendNext, 100);
-          } else if (frame.type === 'quotes') {
-            for (const quote of frame.quotes) {
-              if (this.accepted.has(quote.code)) {
-                this.retryAttempt = 0;
-                receivedQuote = true;
-                this.quote(quote);
-                this.state({ kind: 'live', message: 'KRX 체결 수신 중' });
-              }
-            }
-          }
-        } catch { fail('KRX 응답 형식 오류. 연결 로그를 확인하세요.', false); }
-      });
-      socket.on('pong', () => { if (this.active(generation) && this.transport === socket && !failed) touch(); });
-      socket.on('error', () => fail('시세 서버 연결 오류', true));
-      socket.on('close', () => fail('시세 서버 연결 종료', true));
-    } catch (error) {
-      if (!this.active(generation)) return;
-      this.failure(generation, error instanceof ApprovalError ? error.message : '키 저장소 또는 연결 초기화 오류',
-        error instanceof ApprovalError && error.retryable);
-    }
-  }
-
-  private failure(generation: number, message: string, retryable: boolean): void {
-    this.clearTimers();
-    const socket = this.transport;
-    this.transport = undefined;
-    socket?.terminate();
-    this.accepted.clear(); this.pending = undefined;
-    if (!retryable) {
-      this.running = false;
-      this.approvalKey = undefined;
-      this.state({ kind: 'error', message });
-      return;
-    }
-    const delay = Math.min(30, 2 ** Math.min(this.retryAttempt++, 5)) * 1000;
-    this.state({ kind: 'retry', message: `${message} · ${delay / 1000}초 후 재연결` });
-    this.retryTimer = this.deps.schedule(() => {
-      this.retryTimer = undefined;
-      if (this.active(generation)) void this.connect(generation);
+  private schedule(generation: number, delay: number, kind: 'poll' | 'retry'): void {
+    this.nextKind = kind;
+    this.timer = this.deps.schedule(() => {
+      this.timer = this.nextKind = undefined;
+      if (this.active(generation)) void this.cycle(generation);
     }, delay);
+  }
+
+  private pause(generation: number, delay: number): Promise<boolean> {
+    if (delay <= 0) return Promise.resolve(this.active(generation));
+    return new Promise(resolve => {
+      const handle = this.deps.schedule(() => { this.wait = undefined; resolve(this.active(generation)); }, delay);
+      this.wait = { handle, resolve };
+    });
+  }
+
+  private fail(generation: number, error: unknown, prefix = ''): void {
+    if (!this.active(generation)) return;
+    const failure = error instanceof KisError ? error : new KisError('fatal', '보안 저장소 또는 조회 처리 오류');
+    if (failure.kind === 'cooldown') {
+      this.state({ kind: 'waiting', message: `인증 대기 · ${Math.ceil(failure.retryAfter / 1000)}초 후 확인` });
+      this.schedule(generation, failure.retryAfter, 'retry');
+    } else if (failure.kind === 'transient' && this.failures++ < 5) {
+      const delay = Math.max(Math.min(60, 5 * 2 ** (this.failures - 1)) * 1000, failure.retryAfter);
+      this.state({ kind: 'retry', message: `${prefix}${failure.message} · ${Math.ceil(delay / 1000)}초 후 재조회` });
+      this.schedule(generation, delay, 'retry');
+    } else {
+      this.running = false;
+      this.abort?.abort();
+      this.state({ kind: 'error', message: `${prefix}${failure.message} · 조회 중단. 연결 명령으로 다시 시작하세요.` });
+    }
+  }
+
+  private async cycle(generation: number): Promise<void> {
+    if (!this.active(generation)) return;
+    this.cycleStarted = this.deps.now();
+    const signal = this.abort!.signal;
+    this.state({ kind: 'connecting', message: 'HTTPS KRX 조회 중' });
+    try {
+      const session = await this.deps.session(signal);
+      if (!this.active(generation)) return;
+      if (!session) { this.running = false; this.state({ kind: 'keys', message: '실전 API 키 등록 필요' }); return; }
+      let failure: { error: KisError; code: string } | undefined;
+      for (const stock of this.stocks) {
+        if (!await this.pause(generation, this.lastRequestAt + 1000 - this.deps.now()) || !this.active(generation)) return;
+        this.lastRequestAt = this.deps.now();
+        try {
+          const quote = await this.deps.request(stock, session, signal);
+          if (!this.active(generation)) return;
+          this.quote(quote);
+        } catch (error) {
+          if (!this.active(generation)) return;
+          if (error instanceof KisError && error.kind === 'auth' && !this.recoveringAuth) {
+            this.recoveringAuth = true;
+            await this.deps.invalidate(session.token);
+            if (!this.active(generation)) return;
+            this.state({ kind: 'waiting', message: '접근토큰 재인증 대기' });
+            this.schedule(generation, 1000, 'retry'); return;
+          }
+          if (!(error instanceof KisError) || error.kind !== 'transient') { this.fail(generation, error, `${stock.code} · `); return; }
+          failure = { error, code: stock.code };
+          if (error.retryAfter > 0) break;
+        }
+      }
+      if (failure) { this.fail(generation, failure.error, `부분 조회 실패 ${failure.code} · `); return; }
+      this.failures = 0; this.recoveringAuth = false;
+      this.state({ kind: 'live', message: `HTTPS ${this.interval / 1000}초 주기 조회` });
+      this.schedule(generation, Math.max(0, this.cycleStarted + this.interval - this.deps.now()), 'poll');
+    } catch (error) { this.fail(generation, error); }
   }
 }
 
-export function createClient(credentials: Dependencies['credentials'], state: (state: State) => void,
-  quote: (quote: Quote) => void): KisClient {
+export function createClient(state: (state: State) => void, quote: (quote: Quote) => void, tokens: KisTokenProvider): KisClient {
   return new KisClient(state, quote, {
-    credentials, approval: requestApproval,
-    socket: () => new WebSocket('ws://ops.koreainvestment.com:21000/tryitout', { handshakeTimeout: 10_000, maxPayload: 1024 * 1024 }),
+    session: signal => tokens.get(signal), invalidate: token => tokens.invalidate(token), request: requestQuote,
     schedule: (callback, delay) => setTimeout(callback, delay),
-    cancel: handle => clearTimeout(handle as ReturnType<typeof setTimeout>)
+    cancel: handle => clearTimeout(handle as ReturnType<typeof setTimeout>), now: Date.now
   });
 }

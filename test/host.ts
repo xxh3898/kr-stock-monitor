@@ -17,6 +17,8 @@ export async function run(): Promise<void> {
     const config = vscode.workspace.getConfiguration('krStockMonitor');
     await config.update('stocks', [{ code: '000990', name: 'DB하이텍' }, { code: '204320', name: 'HL만도' }, { code: '108860', name: '셀바스AI' }], vscode.ConfigurationTarget.Global);
     await config.update('displayMode', 'all', vscode.ConfigurationTarget.Global);
+    assert.equal(config.get('pollingInterval'), 5);
+    await config.update('pollingInterval', 10, vscode.ConfigurationTarget.Global);
     await vscode.commands.executeCommand('krStockMonitor.demo');
     await new Promise<void>(resolve => setTimeout(resolve, 1100));
     await config.update('rotationInterval', 1, vscode.ConfigurationTarget.Global);
@@ -24,7 +26,7 @@ export async function run(): Promise<void> {
     await new Promise<void>(resolve => setTimeout(resolve, 1100));
     await config.update('displayMode', 'all', vscode.ConfigurationTarget.Global);
     await vscode.commands.executeCommand('krStockMonitor.disconnect');
-    await fs.writeFile(evidence, JSON.stringify({ passed: true, version: extension.packageJSON.version, checks: ['real Extension Host activation', 'display mode command registration', 'three stocks in isolated configuration', 'demo all/rotate mode switching', 'disconnect'], liveApiTested: false }, null, 2));
+    await fs.writeFile(evidence, JSON.stringify({ passed: true, version: extension.packageJSON.version, checks: ['real Extension Host activation', 'display mode command registration', 'three stocks in isolated configuration', 'demo all/rotate mode switching', 'HTTPS polling configuration', 'disconnect'], liveApiTested: false }, null, 2));
   } catch (error) {
     await fs.writeFile(evidence, JSON.stringify({ passed: false, error: error instanceof Error ? error.message : 'Unknown host failure' }));
     throw error;
