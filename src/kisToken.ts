@@ -18,7 +18,7 @@ export class KisError extends Error {
 }
 
 // Call only fixed KIS endpoints; never log request/response bodies or headers.
-export async function requestJson(url: string, options: RequestInit, signal: AbortSignal): Promise<any> {
+export async function requestJson(url: string, options: RequestInit, signal: AbortSignal, metadata?: { continuation?: string }): Promise<any> {
   signal.throwIfAborted();
   let response: Response;
   try {
@@ -58,13 +58,14 @@ export async function requestJson(url: string, options: RequestInit, signal: Abo
   if (!Number.isFinite(retryAfter) || retryAfter > MAX_TIMER_DELAY) throw new KisError('fatal', '서버 재시도 대기시간 형식 오류');
   if (code === 'EGW00133') throw new KisError('transient', '접근토큰 발급 제한 (EGW00133)', Math.max(ISSUE_INTERVAL, retryAfter));
   if (response.status === 401 || code === 'EGW00123') throw new KisError('auth', '접근토큰 인증 오류');
-  if (response.status === 429 || response.status >= 500 || code === 'EGW00201') {
+  if (response.status === 429 || response.status >= 500 || code === 'EGW00201' || code === 'EGW00215') {
     throw new KisError('transient', `HTTPS 일시 오류 (HTTP ${response.status}, ${code})`,
-      response.status === 429 || code === 'EGW00201' ? Math.max(5000, retryAfter) : retryAfter);
+      response.status === 429 || code === 'EGW00201' || code === 'EGW00215' ? Math.max(5000, retryAfter) : retryAfter);
   }
   if (!response.ok) throw new KisError('fatal', `HTTPS 요청 거절 (HTTP ${response.status}, ${code})`);
   if (!data || typeof data !== 'object' || Array.isArray(data)) throw new KisError('fatal', 'HTTPS 응답 형식 오류');
   if (data.rt_cd !== undefined && data.rt_cd !== '0') throw new KisError('fatal', `시세 요청 거절 (${code})`);
+  if (metadata) metadata.continuation = response.headers.get('tr_cont')?.trim() ?? '';
   return data;
 }
 

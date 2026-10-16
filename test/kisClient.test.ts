@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Dependencies, KisClient, requestQuote, State } from '../src/kisClient';
+import { Dependencies, KisClient, requestBalance, requestQuote, State } from '../src/kisClient';
+import { BalancePage, Profit, ProfitMonitor } from '../src/profit';
 import { KisError, KisTokenProvider, Session } from '../src/kisToken';
 import { parseQuote, Quote } from '../src/quote';
 import { quoteResponse, tokenResponse, settle } from './fixtures';
@@ -178,4 +179,99 @@ test('a late response from a previous start cannot overwrite the new generation'
   assert.equal(h.quotes[0].code, stocks[1].code);
   finish(parseQuote(quoteResponse(stocks[0].code), stocks[0].code)); await settle();
   assert.equal(h.quotes.length, 1); h.client.stop();
+});
+
+const account = { cano: '12345678', productCode: '01' };
+const profit: Profit = { purchase: 1000000n, valuation: 1123456n, amount: 123456n, receivedAt: 123 };
+function profitMonitor() {
+  const values: Profit[] = [], messages: string[] = [];
+  const monitor: ProfitMonitor = { account, received: value => values.push(value), status: message => messages.push(message) };
+  return { values, messages, monitor };
+}
+
+test('balances share serial pacing with quotes, finish all pages and publish the final summary once', async () => {
+  const p = profitMonitor(); const times: number[] = []; let pages = 0;
+  const h = harness({ balance: async (_a, _s, _signal, next) => {
+    times.push(h.now()); pages++;
+    if (pages % 2 === 1) { assert.equal(next, undefined); return { profit, next: { fk: 'fk', nk: 'nk' } }; }
+    assert.deepEqual(next, { fk: 'fk', nk: 'nk' }); return { profit: { ...profit, amount: 234567n } };
+  } });
+  h.client.start(stocks, 5, p.monitor); await settle();
+  await h.next(1000); await h.next(1000); await h.next(1000);
+  assert.equal(p.values.length, 0); await h.next(1000);
+  assert.equal(p.values.length, 1); assert.equal(p.values[0].amount, 234567n);
+  assert.deepEqual(times, [3000, 4000]); await h.next(1000);
+  assert.equal(h.requests[3].at, 5000); h.client.stop();
+});
+
+test('profit-only queries work; stopping during a page ignores late profit and schedules nothing', async () => {
+  const p = profitMonitor(); let finish!: (page: BalancePage) => void;
+  const h = harness({ balance: async () => new Promise(resolve => { finish = resolve; }) });
+  h.client.start([], 5, p.monitor); await settle(); assert.equal(h.requests.length, 0);
+  h.client.stop(); finish({ profit }); await settle(); assert.equal(p.values.length, 0); assert.equal(h.tasks.size, 0);
+});
+
+test('incomplete balances never publish; cursor loops and page limit stop only profit while quotes continue', async () => {
+  for (const loop of [true, false]) {
+    const p = profitMonitor(); let pages = 0;
+    const h = harness({ balance: async () => ({ profit, next: { fk: 'fk', nk: loop ? 'same' : String(++pages) } }) });
+    h.client.start([stocks[0]], 5, p.monitor); await settle();
+    for (let i = 0; i < (loop ? 2 : 20); i++) await h.next(1000);
+    assert.equal(p.values.length, 0); assert.match(p.messages.at(-1)!, /손익 조회 중단/);
+    assert.match(p.messages.at(-1)!, loop ? /커서 반복/ : /상한 초과/);
+    const count = h.quotes.length; await h.next(); if (h.quotes.length === count) await h.next(1000);
+    assert.ok(h.quotes.length > count); h.client.stop();
+  }
+});
+
+test('profit permissions errors keep quotes live and do not leak unknown errors', async () => {
+  const p = profitMonitor(); let calls = 0;
+  const h = harness({ balance: async () => { calls++; throw new Error('synthetic-private-response'); } });
+  h.client.start([stocks[0]], 5, p.monitor); await settle(); await h.next(1000);
+  assert.match(p.messages.at(-1)!, /손익 조회 중단/); assert.ok(!p.messages.join().includes('synthetic-private-response'));
+  await h.next(4000); assert.equal(h.quotes.length, 2); assert.equal(calls, 1); h.client.stop();
+});
+
+test('profit retries back off independently, reset after success and preserve the previous snapshot on failure', async () => {
+  const p = profitMonitor(); let fail = false, requests = 0;
+  const h = harness({ balance: async () => { requests++; if (fail) throw new KisError('transient', '일시 오류'); return { profit }; } });
+  h.client.start([], 5, p.monitor); await settle(); assert.equal(p.values.length, 1);
+  fail = true; await h.next(5000); assert.equal(p.values.length, 1); assert.match(p.messages.at(-1)!, /갱신 지연/);
+  await h.next(5000); const count = requests; await h.next(5000); assert.equal(requests, count);
+  fail = false; await h.next(5000); assert.equal(p.values.length, 2); assert.equal(p.messages.at(-1), ''); h.client.stop();
+});
+
+test('balance Retry-After pauses all requests and authentication recovery shares the existing token provider', async () => {
+  const p = profitMonitor(); let failure = new KisError('transient', '원장 제한', 90000);
+  const h = harness({ balance: async () => { throw failure; } });
+  h.client.start([stocks[0]], 5, p.monitor); await settle(); await h.next(1000);
+  await h.next(90000); assert.equal(h.requests.length, 2); failure = new KisError('auth', '인증 오류');
+  await h.next(1000); assert.equal(h.invalidations(), 1);
+  await h.next(1000); await h.next(1000); assert.match(p.messages.at(-1)!, /손익 조회 중단/); h.client.stop();
+});
+
+test('HTTPS balance contract is read-only, uses integrated valuation and carries pagination securely', async t => {
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, options?: RequestInit) => {
+    const u = new URL(String(url)), headers = new Headers(options?.headers);
+    assert.equal(u.origin, 'https://openapi.koreainvestment.com:9443'); assert.equal(u.pathname, '/uapi/domestic-stock/v1/trading/inquire-balance');
+    assert.equal(u.searchParams.get('CANO'), account.cano); assert.equal(u.searchParams.get('ACNT_PRDT_CD'), '01');
+    assert.equal(u.searchParams.get('AFHR_FLPR_YN'), 'Y'); assert.equal(u.searchParams.get('PRCS_DVSN'), '00');
+    assert.equal(u.searchParams.get('CTX_AREA_NK100'), 'nk'); assert.ok(!String(url).includes('synthetic'));
+    assert.equal(options?.method, 'GET'); assert.equal(options?.redirect, 'error');
+    assert.equal(headers.get('tr_cont'), 'N'); assert.equal(headers.get('tr_id'), 'TTTC8434R');
+    assert.equal(headers.get('authorization'), `Bearer ${session.token}`); assert.equal(headers.get('appsecret'), session.credentials.appSecret);
+    return Response.json({ rt_cd: '0', output1: [], output2: [{ pchs_amt_smtl_amt: '1000000', evlu_amt_smtl_amt: '1123456', evlu_pfls_smtl_amt: '123456' }], ctx_area_fk100: '', ctx_area_nk100: '' }, { headers: { tr_cont: 'D' } });
+  });
+  const result = await requestBalance(account, session, new AbortController().signal, { fk: 'fk', nk: 'nk' });
+  assert.equal(result.profit.amount, profit.amount); assert.equal(result.next, undefined);
+});
+
+test('profit-only retry budget reaches all backoff levels then stops without an idle polling loop', async () => {
+  const p = profitMonitor(); const times: number[] = [];
+  const h = harness({ balance: async () => { times.push(h.now()); throw new KisError('transient', '일시 오류'); } });
+  h.client.start([], 5, p.monitor); await settle();
+  for (let i = 0; i < 40 && h.tasks.size; i++) await h.next();
+  assert.deepEqual(times, [0, 5000, 15000, 35000, 75000, 135000]);
+  assert.equal(h.tasks.size, 0); assert.equal(h.states.at(-1)?.kind, 'error');
+  assert.match(p.messages.at(-1)!, /손익 조회 중단/); h.client.stop();
 });

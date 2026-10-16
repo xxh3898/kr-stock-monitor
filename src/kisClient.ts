@@ -1,5 +1,6 @@
 import { parseQuote, Quote, Stock } from './quote';
 import { BASE_URL, KisError, KisTokenProvider, requestJson, Session } from './kisToken';
+import { Account, BalancePage, parseAccount, parseBalancePage, ProfitMonitor } from './profit';
 export type { Credentials } from './kisToken';
 
 export type State = { kind: 'idle' | 'keys' | 'connecting' | 'waiting' | 'live' | 'retry' | 'error'; message: string };
@@ -7,6 +8,7 @@ export interface Dependencies {
   session(signal: AbortSignal): Promise<Session | undefined>;
   invalidate(token: string): Promise<void>;
   request(stock: Stock, session: Session, signal: AbortSignal): Promise<Quote>;
+  balance?(account: Account, session: Session, signal: AbortSignal, next?: { fk: string; nk: string }): Promise<BalancePage>;
   schedule(callback: () => void, delay: number): unknown;
   cancel(handle: unknown): void;
   now(): number;
@@ -25,6 +27,22 @@ export async function requestQuote(stock: Stock, session: Session, signal: Abort
   catch { throw new KisError('fatal', '현재가 응답 형식 오류'); }
 }
 
+export async function requestBalance(account: Account, session: Session, signal: AbortSignal, next?: { fk: string; nk: string }): Promise<BalancePage> {
+  const valid = parseAccount(account);
+  const url = new URL(`${BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance`);
+  const params = { CANO: valid.cano, ACNT_PRDT_CD: valid.productCode, AFHR_FLPR_YN: 'Y', OFL_YN: '',
+    INQR_DVSN: '01', UNPR_DVSN: '01', FUND_STTL_ICLD_YN: 'N', FNCG_AMT_AUTO_RDPT_YN: 'N', PRCS_DVSN: '00',
+    CTX_AREA_FK100: next?.fk ?? '', CTX_AREA_NK100: next?.nk ?? '' };
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const metadata: { continuation?: string } = {};
+  const data = await requestJson(url.toString(), { method: 'GET', headers: {
+    'content-type': 'application/json', authorization: `Bearer ${session.token}`, appkey: session.credentials.appKey,
+    appsecret: session.credentials.appSecret, tr_id: 'TTTC8434R', custtype: 'P', tr_cont: next ? 'N' : ''
+  } }, signal, metadata);
+  try { return parseBalancePage(data, metadata.continuation ?? ''); }
+  catch { throw new KisError('fatal', '잔고 응답 형식 또는 연속조회 정보 오류'); }
+}
+
 export class KisClient {
   private generation = 0;
   private running = false;
@@ -38,14 +56,19 @@ export class KisClient {
   private failures = 0;
   private recoveringAuth = false;
   private stocks: Stock[] = [];
+  private profit?: ProfitMonitor;
+  private profitFailures = 0;
+  private profitRetryAt = 0;
+  private profitDisabled = false;
 
   constructor(private readonly state: (state: State) => void, private readonly quote: (quote: Quote) => void,
     private readonly deps: Dependencies) {}
 
-  start(stocks: Stock[], interval = 5): void {
+  start(stocks: Stock[], interval = 5, profit?: ProfitMonitor): void {
     this.stop();
-    if (!stocks.length) { this.state({ kind: 'idle', message: '관심 종목을 추가하세요' }); return; }
+    if (!stocks.length && !profit) { this.state({ kind: 'idle', message: '관심 종목을 추가하세요' }); return; }
     this.stocks = stocks;
+    this.profit = profit;
     this.interval = interval * 1000;
     this.running = true;
     this.abort = new AbortController();
@@ -69,6 +92,7 @@ export class KisClient {
     this.timer = this.nextKind = undefined;
     if (this.wait) { this.deps.cancel(this.wait.handle); this.wait.resolve(false); this.wait = undefined; }
     this.failures = 0; this.recoveringAuth = false;
+    this.profit = undefined; this.profitFailures = 0; this.profitRetryAt = 0; this.profitDisabled = false;
     this.state({ kind: 'idle', message: '연결 안 됨' });
   }
 
@@ -118,8 +142,7 @@ export class KisClient {
       if (!session) { this.running = false; this.state({ kind: 'keys', message: '실전 API 키 등록 필요' }); return; }
       let failure: { error: KisError; code: string } | undefined;
       for (const stock of this.stocks) {
-        if (!await this.pause(generation, this.lastRequestAt + 1000 - this.deps.now()) || !this.active(generation)) return;
-        this.lastRequestAt = this.deps.now();
+        if (!await this.pace(generation)) return;
         try {
           const quote = await this.deps.request(stock, session, signal);
           if (!this.active(generation)) return;
@@ -139,16 +162,70 @@ export class KisClient {
         }
       }
       if (failure) { this.fail(generation, failure.error, `부분 조회 실패 ${failure.code} · `); return; }
+      if (!await this.pollProfit(generation, session, signal) || !this.active(generation)) return;
       this.failures = 0; this.recoveringAuth = false;
       this.state({ kind: 'live', message: `HTTPS ${this.interval / 1000}초 주기 조회` });
       this.schedule(generation, Math.max(0, this.cycleStarted + this.interval - this.deps.now()), 'poll');
     } catch (error) { this.fail(generation, error); }
   }
+
+  private async pace(generation: number): Promise<boolean> {
+    if (!await this.pause(generation, this.lastRequestAt + 1000 - this.deps.now()) || !this.active(generation)) return false;
+    this.lastRequestAt = this.deps.now();
+    return true;
+  }
+
+  private async pollProfit(generation: number, session: Session, signal: AbortSignal): Promise<boolean> {
+    const monitor = this.profit;
+    if (!monitor || this.profitDisabled || this.deps.now() < this.profitRetryAt) return true;
+    try {
+      let next: { fk: string; nk: string } | undefined;
+      const seen = new Set<string>();
+      for (let page = 0; page < 20; page++) {
+        if (!await this.pace(generation)) return false;
+        if (!this.deps.balance) throw new KisError('fatal', '잔고 조회 처리 오류');
+        const result = await this.deps.balance(monitor.account, session, signal, next);
+        if (!this.active(generation)) return false;
+        if (!result.next) {
+          this.profitFailures = 0; this.profitRetryAt = 0;
+          monitor.received(result.profit); monitor.status(''); return true;
+        }
+        const cursor = JSON.stringify(result.next);
+        if (seen.has(cursor)) throw new KisError('fatal', '잔고 연속조회 커서 반복');
+        seen.add(cursor); next = result.next;
+      }
+      throw new KisError('fatal', '잔고 연속조회 상한 초과 · 전체 결과 미확인');
+    } catch (error) {
+      if (!this.active(generation)) return false;
+      const failure = error instanceof KisError ? error : new KisError('fatal', '잔고 조회 처리 오류');
+      if (failure.kind === 'auth' && !this.recoveringAuth) {
+        this.recoveringAuth = true;
+        monitor.status('손익 인증 재확인 중');
+        await this.deps.invalidate(session.token);
+        if (!this.active(generation)) return false;
+        this.schedule(generation, 1000, 'retry'); return false;
+      }
+      if (failure.kind === 'transient' && this.profitFailures++ < 5) {
+        const delay = Math.max(Math.min(60, 5 * 2 ** (this.profitFailures - 1)) * 1000, failure.retryAfter);
+        this.profitRetryAt = this.deps.now() + delay;
+        monitor.status(`손익 갱신 지연 · ${failure.message}`);
+        if (failure.retryAfter > 0) { this.fail(generation, failure, '손익 · '); return false; }
+      } else {
+        this.profitDisabled = true;
+        monitor.status(`손익 조회 중단 · ${failure.message}`);
+        if (!this.stocks.length) {
+          this.running = false;
+          this.state({ kind: 'error', message: `손익 조회 중단 · ${failure.message}` });
+        }
+      }
+      return true;
+    }
+  }
 }
 
 export function createClient(state: (state: State) => void, quote: (quote: Quote) => void, tokens: KisTokenProvider): KisClient {
   return new KisClient(state, quote, {
-    session: signal => tokens.get(signal), invalidate: token => tokens.invalidate(token), request: requestQuote,
+    session: signal => tokens.get(signal), invalidate: token => tokens.invalidate(token), request: requestQuote, balance: requestBalance,
     schedule: (callback, delay) => setTimeout(callback, delay),
     cancel: handle => clearTimeout(handle as ReturnType<typeof setTimeout>), now: Date.now
   });

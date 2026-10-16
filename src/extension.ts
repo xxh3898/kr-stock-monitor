@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { createClient, Credentials, KisClient, State } from './kisClient';
 import { KisTokenProvider } from './kisToken';
 import { formatQuote, Quote, Stock, validateStocks } from './quote';
+import { ACCOUNT_KEY, Account, formatProfit, parseAccount, Profit } from './profit';
 
 const SECRET_KEY = 'kis.real.credentials.v1';
 const PREFIX = 'krStockMonitor';
@@ -18,6 +19,10 @@ class Monitor implements vscode.Disposable {
   private mode: 'idle' | 'real' | 'demo' = 'idle';
   private displayMode: 'all' | 'rotate' = 'all';
   private pollingInterval = 5;
+  private showProfit = false;
+  private profit?: Profit;
+  private profitMessage = '';
+  private connection = 0;
   private rotation?: ReturnType<typeof setInterval>;
   private demoTimer?: ReturnType<typeof setInterval>;
   private selected = 0;
@@ -36,6 +41,7 @@ class Monitor implements vscode.Disposable {
     const commands: Record<string, () => unknown> = {
       menu: () => this.menu(), connect: () => this.connect(), disconnect: () => this.disconnect(),
       registerKeys: () => this.registerKeys(), removeKeys: () => this.removeKeys(),
+      registerAccount: () => this.registerAccount(), removeAccount: () => this.removeAccount(),
       addStock: () => this.addStock(), removeStock: () => this.removeStock(),
       demo: () => this.demo(), displayMode: () => this.chooseDisplayMode(), showLogs: () => this.output.show()
     };
@@ -46,6 +52,12 @@ class Monitor implements vscode.Disposable {
     }
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
       if (!event.affectsConfiguration(PREFIX)) return;
+      if (event.affectsConfiguration(`${PREFIX}.showProfit`)) {
+        const connected = this.mode === 'real';
+        this.profit = undefined; this.profitMessage = '';
+        if (connected) void this.connect(); else this.configure();
+        return;
+      }
       if (!event.affectsConfiguration(`${PREFIX}.stocks`)) {
         if (this.configure() && this.mode === 'real' && event.affectsConfiguration(`${PREFIX}.pollingInterval`)) {
           this.client.updateInterval(this.pollingInterval);
@@ -61,7 +73,13 @@ class Monitor implements vscode.Disposable {
       }
     }));
     context.subscriptions.push(context.secrets.onDidChange(event => {
+      if (event.key === ACCOUNT_KEY) {
+        this.profit = undefined; this.profitMessage = '';
+        if (this.mode === 'real') void this.connect(); else this.render();
+        return;
+      }
       if (event.key !== SECRET_KEY) return;
+      this.profit = undefined; this.profitMessage = '';
       if (this.mode === 'real') this.disconnect();
       void this.tokens.clear().catch(() => {
         if (!this.disposed) void vscode.window.showErrorMessage('파생 토큰 캐시를 삭제하지 못했습니다. 보안 저장소를 확인하세요.');
@@ -75,6 +93,9 @@ class Monitor implements vscode.Disposable {
     this.rotation = undefined;
     try {
       const config = vscode.workspace.getConfiguration(PREFIX);
+      const showProfit = config.get<boolean>('showProfit', false);
+      if (typeof showProfit !== 'boolean') throw new Error('손익 표시 설정은 true 또는 false로 입력하세요.');
+      this.showProfit = showProfit;
       this.stocks = validateStocks(config.get('stocks', []));
       const pollingInterval = config.get<number>('pollingInterval', 5);
       if (!Number.isInteger(pollingInterval) || pollingInterval < 5 || pollingInterval > 300) throw new Error('조회 간격은 5~300초 정수로 설정하세요.');
@@ -132,17 +153,68 @@ class Monitor implements vscode.Disposable {
     void vscode.window.showInformationMessage('등록한 키를 삭제했습니다.');
   }
 
-  private connect(): void {
+  private async readAccount(): Promise<{ account?: Account; message: string }> {
+    try {
+      const saved = await this.context.secrets.get(ACCOUNT_KEY);
+      if (!saved) return { message: '손익 계좌 등록 필요' };
+      return { account: parseAccount(JSON.parse(saved)), message: '' };
+    } catch { return { message: '손익 계좌 등록 정보를 확인하세요' }; }
+  }
+
+  private async registerAccount(): Promise<void> {
+    const cano = await vscode.window.showInputBox({ title: '손익 조회 계좌번호 앞 8자리', password: true, ignoreFocusOut: true,
+      prompt: '처음 한 번 등록하면 VS Code 보안 저장소에 보관합니다.', validateInput: value => /^\d{8}$/.test(value.trim()) ? undefined : '앞 8자리 숫자를 입력하세요.' });
+    if (!cano || this.disposed) return;
+    const productCode = await vscode.window.showInputBox({ title: '계좌 상품코드 뒤 2자리', ignoreFocusOut: true,
+      placeHolder: '예: 01', validateInput: value => /^\d{2}$/.test(value.trim()) ? undefined : '뒤 2자리 숫자를 입력하세요.' });
+    if (!productCode || this.disposed) return;
+    const account = parseAccount({ cano: cano.trim(), productCode: productCode.trim() });
+    const connected = this.mode === 'real';
+    this.disconnect();
+    await this.context.secrets.store(ACCOUNT_KEY, JSON.stringify(account));
+    if (this.disposed) return;
+    await vscode.workspace.getConfiguration(PREFIX).update('showProfit', true, vscode.ConfigurationTarget.Global);
+    if (connected && !this.disposed) await this.connect();
+    if (!this.disposed) void vscode.window.showInformationMessage('손익 계좌를 저장했습니다. 이후에는 다시 입력하지 않아도 됩니다. HTTPS KRX 시세 조회 시작으로 조회하세요.');
+  }
+
+  private async removeAccount(): Promise<void> {
+    const answer = await vscode.window.showWarningMessage('손익 조회 계좌를 보안 저장소에서 삭제할까요? API 키와 관심종목은 유지합니다.', { modal: true }, '삭제');
+    if (answer !== '삭제' || this.disposed) return;
+    const connected = this.mode === 'real';
+    this.disconnect();
+    await this.context.secrets.delete(ACCOUNT_KEY);
+    await vscode.workspace.getConfiguration(PREFIX).update('showProfit', false, vscode.ConfigurationTarget.Global);
+    if (connected && !this.disposed) await this.connect();
+  }
+
+  private async connect(): Promise<void> {
     if (this.disposed) return;
     this.disconnect();
     if (!this.configure()) return;
     this.mode = 'real';
+    const connection = this.connection;
     // Demo values must never be reused as live prices.
     this.quotes.clear();
-    this.client.start(this.stocks, this.pollingInterval);
+    const registration = this.showProfit ? await this.readAccount() : undefined;
+    if (this.disposed || connection !== this.connection) return;
+    const account = registration?.account;
+    this.profitMessage = registration?.message ?? '';
+    this.client.start(this.stocks, this.pollingInterval, account ? {
+      account,
+      received: value => {
+        if (!this.disposed && connection === this.connection) { this.profit = value; this.profitMessage = ''; this.render(); }
+      },
+      status: message => {
+        if (!this.disposed && connection === this.connection) { this.profitMessage = message; this.render(); }
+      }
+    } : undefined);
+    this.render();
   }
 
   private disconnect(): void {
+    this.connection++;
+    this.profit = undefined; this.profitMessage = '';
     if (this.demoTimer) clearInterval(this.demoTimer);
     this.demoTimer = undefined;
     const wasDemo = this.mode === 'demo';
@@ -202,6 +274,7 @@ class Monitor implements vscode.Disposable {
     })) : [];
     options.push(...[
       ['HTTPS KRX 시세 조회 시작', 'connect'], ['연결 끊기', 'disconnect'], ['실전 API 키 등록', 'registerKeys'],
+      ['손익 계좌 등록', 'registerAccount'], ['손익 계좌 삭제', 'removeAccount'],
       ['관심 종목 추가', 'addStock'], ['관심 종목 삭제', 'removeStock'], ['표시 방식 선택', 'displayMode'], ['가상 시세 데모', 'demo'], ['연결 로그 보기', 'showLogs']
     ].map(([label, command]) => ({ label, command: `${PREFIX}.${command}` })));
     const picked = await vscode.window.showQuickPick(options, { title: `KR Stock Monitor · ${this.state.message}` });
@@ -213,10 +286,14 @@ class Monitor implements vscode.Disposable {
   private render(): void {
     if (this.disposed) return;
     const visibleStocks = this.displayMode === 'all' ? this.stocks : this.stocks.slice(this.selected, this.selected + 1);
-    const text = visibleStocks.map(stock => {
+    let text = visibleStocks.map(stock => {
       const quote = this.quotes.get(stock.code);
       return `${stock.name} ${quote ? formatQuote(quote) : '시세 대기'}`;
     }).join(' | ');
+    if (this.showProfit && this.mode === 'real') {
+      const profit = this.profit ? formatProfit(this.profit) : '평가손익 —';
+      text = [text, `[KRX+NXT] ${profit}${this.profitMessage ? ' ⚠' : ''}`].filter(Boolean).join(' | ');
+    }
     const prefix = this.mode === 'demo' ? '[데모] ' : '[KRX · HTTPS] ';
     const status = this.mode === 'real' && (this.state.kind === 'live' || this.state.kind === 'connecting') ? '' : ` · ${this.state.message}`;
     this.bar.text = text ? `${prefix}${text}${status}` : `KR Stock · ${this.state.kind === 'error' ? this.state.message : '관심 종목 추가'}`;
@@ -226,6 +303,9 @@ class Monitor implements vscode.Disposable {
       return `${item.name} (${item.code}) ${q ? `${formatQuote(q)}\n  마지막 ${this.mode === 'demo' ? '가상 갱신' : '조회'} ${time} KST` : '조회 대기'}`;
     });
     this.bar.tooltip = [`${this.mode === 'demo' ? '데모 가상 시세' : '한국투자증권 · 실전 KRX · HTTPS'}`, this.state.message,
+      ...(this.showProfit && this.mode === 'real' ? ['전체 보유 국내주식 · KRX+NXT 통합시세 평가',
+        this.profit ? `${formatProfit(this.profit)}\n매입 ${this.profit.purchase.toLocaleString('en-US')}원 · 평가 ${this.profit.valuation.toLocaleString('en-US')}원\n손익 마지막 조회 ${new Date(this.profit.receivedAt).toLocaleString('sv-SE', { timeZone: 'Asia/Seoul', hour12: false })} KST` : '손익 조회 대기',
+        this.profitMessage || '수익률 = 합계 평가손익 / 합계 매입금액 × 100 · 앱의 수수료·세금 반영 기준과 다를 수 있습니다.'] : []),
       ...rows, '가격은 마지막 조회 결과이며 조회 시각은 실제 체결 시각이 아닙니다.', '클릭: 종목 및 연결 메뉴'].join('\n');
     this.bar.show();
   }

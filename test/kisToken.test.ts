@@ -114,7 +114,8 @@ test('HTTP/business errors classify auth, quota, token issuance limits and schem
   const fetchMock = t.mock.method(globalThis, 'fetch');
   const cases: [number, unknown, string, number][] = [
     [200, { rt_cd: '1', msg_cd: 'EGW00123' }, 'auth', 0], [401, null, 'auth', 0],
-    [200, { rt_cd: '1', msg_cd: 'EGW00201' }, 'transient', 5000], [429, null, 'transient', 5000], [500, null, 'transient', 0],
+    [200, { rt_cd: '1', msg_cd: 'EGW00201' }, 'transient', 5000], [200, { rt_cd: '1', msg_cd: 'EGW00215' }, 'transient', 5000],
+    [429, null, 'transient', 5000], [500, null, 'transient', 0],
     [403, { msg_cd: 'EGW00133' }, 'transient', 300000], [200, { rt_cd: '1', msg_cd: 'synthetic-secret' }, 'fatal', 0],
     [403, null, 'fatal', 0], [200, null, 'fatal', 0], [200, [], 'fatal', 0]
   ];
@@ -179,4 +180,13 @@ test('corrupt far-future cooldown cannot overflow Node timers into a hot retry l
 test('invalid or excessive Retry-After never reaches a timer', async t => {
   t.mock.method(globalThis, 'fetch', async () => new Response('', { status: 429, headers: { 'retry-after': '2147484' } }));
   await assert.rejects(requestJson('https://openapi.koreainvestment.com:9443/oauth2/tokenP', {}, new AbortController().signal), e => e instanceof KisError && e.kind === 'fatal');
+});
+
+test('response metadata exposes only continuation after successful business validation', async t => {
+  const mock = t.mock.method(globalThis, 'fetch', async () => Response.json({ rt_cd: '0' }, { headers: { tr_cont: 'M', 'set-cookie': 'synthetic-secret' } }));
+  const metadata: { continuation?: string } = {};
+  await requestJson('https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-balance', {}, new AbortController().signal, metadata);
+  assert.deepEqual(metadata, { continuation: 'M' });
+  mock.mock.mockImplementation(async () => Response.json({ rt_cd: '1', msg_cd: 'EGW00215' }, { headers: { 'retry-after': '90' } }));
+  await assert.rejects(requestJson('https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-balance', {}, new AbortController().signal), e => e instanceof KisError && e.kind === 'transient' && e.retryAfter === 90000);
 });

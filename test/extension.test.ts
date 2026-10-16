@@ -3,12 +3,13 @@ import assert from 'node:assert/strict';
 import type { ExtensionContext } from 'vscode';
 import { State } from '../src/kisClient';
 import { Quote } from '../src/quote';
+import { ACCOUNT_KEY, ProfitMonitor } from '../src/profit';
 
 const threeStocks = [{ code: '000990', name: 'DB하이텍' }, { code: '204320', name: 'HL만도' }, { code: '108860', name: '셀바스AI' }];
 
-function environment(initial: Record<string, unknown> = {}) {
+function environment(initial: Record<string, unknown> = {}, saved: Record<string, string> = {}) {
   const commands = new Map<string, () => Promise<void>>();
-  const secrets = new Map<string, string>();
+  const secrets = new Map<string, string>(Object.entries(saved));
   const inputs: (string | undefined)[] = [];
   const picks: (string | undefined)[] = [];
   const notices: string[] = [];
@@ -21,6 +22,8 @@ function environment(initial: Record<string, unknown> = {}) {
   let failStore = false;
   let confirmDelete = false;
   const intervals: number[] = [];
+  const profitMonitors: (ProfitMonitor | undefined)[] = [];
+  let accountRead: Promise<string | undefined> | undefined;
   let stateListener: (state: State) => void = () => {};
   let quoteListener: (quote: Quote) => void = () => {};
   const configuration: Record<string, unknown> = { stocks: [{ code: '204320', name: 'HL만도' }], rotationInterval: 5, ...initial };
@@ -30,7 +33,7 @@ function environment(initial: Record<string, unknown> = {}) {
   const context = {
     subscriptions: [] as { dispose(): void }[],
     secrets: {
-      get: async (key: string) => secrets.get(key),
+      get: async (key: string) => key === ACCOUNT_KEY && accountRead ? accountRead : secrets.get(key),
       store: async (key: string, value: string) => { if (failStore) throw new Error('synthetic-secret'); secrets.set(key, value); secretListener({ key }); },
       delete: async (key: string) => { secrets.delete(key); },
       onDidChange: (listener: typeof secretListener) => { secretListener = listener; return disposable; }
@@ -60,7 +63,8 @@ function environment(initial: Record<string, unknown> = {}) {
     stateListener = state;
     quoteListener = quote;
     return {
-      start(_stocks: unknown, seconds: number) {
+      start(_stocks: unknown, seconds: number, profit?: ProfitMonitor) {
+        profitMonitors.push(profit);
         starts++; intervals.push(seconds);
         void Promise.resolve().then(() => state({ kind: secrets.has('kis.real.credentials.v1') ? 'live' : 'keys', message: secrets.has('kis.real.credentials.v1') ? 'HTTPS 주기 조회' : '실전 API 키 등록 필요' }));
       },
@@ -84,7 +88,9 @@ function environment(initial: Record<string, unknown> = {}) {
     run: async (id: string) => { await commands.get(`krStockMonitor.${id}`)!(); await new Promise<void>(resolve => setImmediate(resolve)); },
     dispose: () => { extension.deactivate(); for (const item of context.subscriptions) item.dispose(); },
     starts: () => starts, stops: () => stops, passwords: () => passwords, failStore: () => { failStore = true; },
-    secretChanged: (key: string) => secretListener({ key }), intervals, confirmDeletion: () => { confirmDelete = true; }, change, state: (value: State) => stateListener(value), quote: (value: Quote) => quoteListener(value) };
+    secretChanged: (key: string) => secretListener({ key }), intervals, profitMonitors,
+    deferAccountRead: () => { let resolve!: (value: string | undefined) => void; accountRead = new Promise(done => { resolve = done; }); return resolve; },
+    confirmDeletion: () => { confirmDelete = true; }, change, state: (value: State) => stateListener(value), quote: (value: Quote) => quoteListener(value) };
 }
 
 test('activation is offline and demo is explicit; switching to real clears simulated prices', async () => {
@@ -258,5 +264,90 @@ test('derived token cache changes do not disconnect but original credential chan
     // Exercise the original credential event path through key registration.
     h.inputs.push('synthetic-key', 'synthetic-secret'); await h.run('registerKeys');
     assert.ok(h.stops() > stops); assert.equal(h.secrets.has('kis.real.restToken.v1'), false);
+  } finally { h.dispose(); }
+});
+
+const savedAccount = JSON.stringify({ cano: '12345678', productCode: '01' });
+const accountSecrets = { [ACCOUNT_KEY]: savedAccount, 'kis.real.credentials.v1': 'synthetic-credentials' };
+const sampleProfit = { purchase: 1000000n, valuation: 1123456n, amount: 123456n, receivedAt: 123 };
+
+test('account registration persists once, keeps existing keys and settings, and is reused after activation', async () => {
+  const h = environment({ stocks: threeStocks, displayMode: 'rotate', rotationInterval: 7 });
+  let stored = '';
+  try {
+    h.secrets.set('kis.real.credentials.v1', 'synthetic-credentials');
+    h.inputs.push('12345678', '01'); await h.run('registerAccount');
+    stored = h.secrets.get(ACCOUNT_KEY)!; assert.equal(stored, savedAccount);
+    assert.equal(h.configuration.showProfit, true); assert.equal(h.starts(), 0);
+    await h.run('connect'); assert.deepEqual(h.profitMonitors.at(-1)?.account, JSON.parse(savedAccount));
+    assert.equal(h.secrets.get('kis.real.credentials.v1'), 'synthetic-credentials');
+    assert.deepEqual(h.configuration.stocks, threeStocks); assert.equal(h.configuration.displayMode, 'rotate'); assert.equal(h.configuration.rotationInterval, 7);
+    assert.ok(!JSON.stringify(h.configuration).includes('12345678')); assert.ok(!h.logs.join().includes('12345678'));
+  } finally { h.dispose(); }
+  const restarted = environment({ showProfit: true }, { ...accountSecrets, [ACCOUNT_KEY]: stored });
+  try { await restarted.run('connect'); assert.ok(restarted.profitMonitors.at(-1)); assert.equal(restarted.inputs.length, 0); }
+  finally { restarted.dispose(); }
+});
+
+test('account registration cancellation, validation and storage failures preserve original registration', async () => {
+  const h = environment({}, accountSecrets);
+  try {
+    for (const pair of [['87654321', undefined], ['invalid', '01'], ['87654321', 'bad']]) {
+      h.inputs.push(...pair); await h.run('registerAccount'); assert.equal(h.secrets.get(ACCOUNT_KEY), savedAccount);
+    }
+    h.failStore(); h.inputs.push('87654321', '01'); await h.run('registerAccount');
+    assert.equal(h.secrets.get(ACCOUNT_KEY), savedAccount); assert.ok(!h.notices.join().includes('synthetic-secret'));
+  } finally { h.dispose(); }
+});
+
+test('both display modes keep profit text stable through polling, expose stale state and ignore old account responses', async () => {
+  for (const displayMode of ['all', 'rotate']) {
+    const h = environment({ stocks: threeStocks, showProfit: true, displayMode }, accountSecrets);
+    try {
+      await h.run('connect'); const monitor = h.profitMonitors.at(-1)!;
+      monitor.received(sampleProfit); const text = h.bar.text;
+      assert.match(text, /\[KRX\+NXT\] 평가손익 \+123,456원 \(\+12.35%\)/);
+      h.state({ kind: 'connecting', message: 'HTTPS KRX 조회 중' }); assert.equal(h.bar.text, text);
+      h.state({ kind: 'live', message: 'HTTPS 주기 조회' }); assert.equal(h.bar.text, text);
+      monitor.status('손익 갱신 지연'); assert.ok(h.bar.text.includes('⚠')); assert.match(h.bar.tooltip, /손익 마지막 조회/); assert.match(h.bar.tooltip, /손익 갱신 지연/);
+      await h.run('disconnect'); monitor.received(sampleProfit); monitor.status('late'); assert.ok(!h.bar.text.includes('123,456'));
+      await h.run('connect'); h.profitMonitors.at(-1)!.received(sampleProfit);
+      h.configuration.showProfit = false; h.change('showProfit'); await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(h.profitMonitors.at(-1), undefined); assert.ok(!h.bar.text.includes('평가손익'));
+    } finally { h.dispose(); }
+  }
+});
+
+test('missing or malformed accounts keep quote polling available and never create a balance monitor', async () => {
+  for (const raw of [undefined, 'invalid-json', JSON.stringify({ cano: 'bad', productCode: '01' })]) {
+    const h = environment({ showProfit: true });
+    try {
+      if (raw) h.secrets.set(ACCOUNT_KEY, raw);
+      await h.run('connect'); assert.equal(h.profitMonitors.at(-1), undefined); assert.equal(h.starts(), 1);
+      assert.match(h.bar.tooltip, /손익 계좌 등록/);
+    } finally { h.dispose(); }
+  }
+});
+
+test('account deletion and credential replacement clear profits while keeping the watchlist and original key contract', async () => {
+  const h = environment({ stocks: threeStocks, showProfit: true }, accountSecrets);
+  try {
+    await h.run('connect'); h.profitMonitors.at(-1)!.received(sampleProfit);
+    await h.run('removeAccount'); assert.equal(h.secrets.get(ACCOUNT_KEY), savedAccount);
+    h.secretChanged('kis.real.credentials.v1'); await new Promise<void>(resolve => setImmediate(resolve));
+    assert.ok(!h.bar.text.includes('123,456')); assert.equal(h.secrets.get(ACCOUNT_KEY), savedAccount);
+    await h.run('connect'); h.profitMonitors.at(-1)!.received(sampleProfit);
+    await h.run('demo'); assert.ok(!h.bar.text.includes('123,456')); assert.ok(h.bar.text.startsWith('[데모]'));
+    h.confirmDeletion(); await h.run('removeAccount'); assert.equal(h.secrets.has(ACCOUNT_KEY), false);
+    assert.equal(h.secrets.get('kis.real.credentials.v1'), 'synthetic-credentials'); assert.deepEqual(h.configuration.stocks, threeStocks);
+  } finally { h.dispose(); }
+});
+
+test('disconnect during account storage read cancels pending connect and cannot restore profit polling', async () => {
+  const h = environment({ showProfit: true }, accountSecrets);
+  try {
+    const resolve = h.deferAccountRead(); const connecting = h.run('connect');
+    await h.run('disconnect'); resolve(savedAccount); await connecting;
+    assert.equal(h.starts(), 0); assert.ok(!h.bar.text.includes('평가손익'));
   } finally { h.dispose(); }
 });

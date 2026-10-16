@@ -2,7 +2,7 @@
   "name": "kr-stock-monitor",
   "displayName": "KR Stock Monitor",
   "description": "한국투자증권 KRX 현재가를 HTTPS로 주기 조회해 상태 표시줄에 표시합니다.",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "publisher": "xxh3898",
   "license": "UNLICENSED",
   "repository": { "type": "git", "url": "https://github.com/xxh3898/kr-stock-monitor.git" },
@@ -16,7 +16,7 @@
     "watch": "tsc -watch -p .",
     "test": "npm run compile && node --test out/test/*.test.js",
     "vscode:prepublish": "npm run compile",
-    "package": "vsce package --skip-license --out kr-stock-monitor-0.1.2.vsix"
+    "package": "vsce package --skip-license --out kr-stock-monitor-0.1.4.vsix"
   },
   "devDependencies": {
     "@types/node": "24.19.2",
@@ -31,6 +31,8 @@
       { "command": "krStockMonitor.disconnect", "title": "연결 끊기", "category": "KR Stock Monitor" },
       { "command": "krStockMonitor.registerKeys", "title": "실전 API 키 등록", "category": "KR Stock Monitor" },
       { "command": "krStockMonitor.removeKeys", "title": "API 키 삭제", "category": "KR Stock Monitor" },
+      { "command": "krStockMonitor.registerAccount", "title": "손익 계좌 등록", "category": "KR Stock Monitor" },
+      { "command": "krStockMonitor.removeAccount", "title": "손익 계좌 삭제", "category": "KR Stock Monitor" },
       { "command": "krStockMonitor.addStock", "title": "관심 종목 추가", "category": "KR Stock Monitor" },
       { "command": "krStockMonitor.removeStock", "title": "관심 종목 삭제", "category": "KR Stock Monitor" },
       { "command": "krStockMonitor.demo", "title": "가상 시세 데모 시작", "category": "KR Stock Monitor" },
@@ -40,6 +42,10 @@
     "configuration": {
       "title": "KR Stock Monitor",
       "properties": {
+        "krStockMonitor.showProfit": {
+          "type": "boolean", "scope": "application", "default": false,
+          "description": "등록 계좌의 국내주식 전체 평가손익·수익률을 KRX+NXT 통합시세로 표시합니다. 손익 계좌 등록 시 자동으로 켜집니다. 계좌번호는 설정 파일에 입력하지 마세요."
+        },
         "krStockMonitor.stocks": {
           "type": "array", "scope": "application", "default": [],
           "description": "KRX 관심 종목. API 키는 설정 파일에 입력하지 마세요.",
