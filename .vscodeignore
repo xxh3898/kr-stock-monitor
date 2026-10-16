@@ -10,3 +10,4 @@ package-lock.json
 *.vsix
 *.log
 .env*
+install-local.ps1
