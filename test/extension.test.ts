@@ -29,7 +29,7 @@ function environment(initial: Record<string, unknown> = {}, saved: Record<string
   const configuration: Record<string, unknown> = { stocks: [{ code: '204320', name: 'HL만도' }], rotationInterval: 5, ...initial };
   const change = (key = 'stocks') => configListener({ affectsConfiguration: (section: string) => section === 'krStockMonitor' || section === `krStockMonitor.${key}` });
   const disposable = { dispose() {} };
-  const bar = { text: '', tooltip: '', name: '', command: '', show() {}, dispose() {} };
+  const bars: { id: string; alignment: number; priority: number; text: string; tooltip: string; name: string; command: string; disposed: boolean; show(): void; dispose(): void }[] = [];
   const context = {
     subscriptions: [] as { dispose(): void }[],
     secrets: {
@@ -40,9 +40,13 @@ function environment(initial: Record<string, unknown> = {}, saved: Record<string
     }
   } as unknown as ExtensionContext;
   const vscode = {
-    StatusBarAlignment: { Right: 2 }, ConfigurationTarget: { Global: 1 },
+    StatusBarAlignment: { Left: 1, Right: 2 }, ConfigurationTarget: { Global: 1 },
     window: {
-      createStatusBarItem: () => bar,
+      createStatusBarItem: (id: string, alignment: number, priority: number) => {
+        const bar = { id, alignment, priority, text: '', tooltip: '', name: '', command: '', disposed: false,
+          show() {}, dispose() { this.disposed = true; } };
+        bars.push(bar); return bar;
+      },
       createOutputChannel: () => ({ appendLine: (text: string) => logs.push(text), show() {}, dispose() {} }),
       showInputBox: async (options: { password?: boolean; title: string }) => { if (options.title.includes('APP')) passwords &&= options.password === true; return inputs.shift(); },
       showInformationMessage: (text: string) => { notices.push(text); },
@@ -84,7 +88,7 @@ function environment(initial: Record<string, unknown> = {}, saved: Record<string
   let extension: typeof import('../src/extension');
   try { extension = require('../src/extension'); } finally { Module._load = load; }
   extension.activate(context);
-  return { bar, inputs, picks, notices, logs, secrets, configuration,
+  return { get bar() { return bars.at(-1)!; }, bars, inputs, picks, notices, logs, secrets, configuration,
     run: async (id: string) => { await commands.get(`krStockMonitor.${id}`)!(); await new Promise<void>(resolve => setImmediate(resolve)); },
     dispose: () => { extension.deactivate(); for (const item of context.subscriptions) item.dispose(); },
     starts: () => starts, stops: () => stops, passwords: () => passwords, failStore: () => { failStore = true; },
@@ -350,4 +354,55 @@ test('disconnect during account storage read cancels pending connect and cannot 
     await h.run('disconnect'); resolve(savedAccount); await connecting;
     assert.equal(h.starts(), 0); assert.ok(!h.bar.text.includes('평가손익'));
   } finally { h.dispose(); }
+});
+
+test('status bar defaults to right, respects left on activation and retains its identity', () => {
+  for (const position of [undefined, 'right', 'left']) {
+    const h = environment(position ? { position } : {});
+    try {
+      assert.equal(h.bar.alignment, position === 'left' ? 1 : 2);
+      assert.equal(h.bar.id, 'kr-stock-monitor'); assert.equal(h.bar.priority, 0);
+      assert.equal(h.bar.name, 'KR Stock Monitor'); assert.equal(h.bar.command, 'krStockMonitor.menu');
+      assert.equal(h.bars.filter(bar => !bar.disposed).length, 1);
+    } finally { h.dispose(); assert.ok(h.bars.every(bar => bar.disposed)); }
+  }
+});
+
+test('left/right changes preserve live prices, profits, menu, secrets and polling in both display modes', async () => {
+  for (const displayMode of ['all', 'rotate']) {
+    const h = environment({ stocks: threeStocks, showProfit: true, displayMode }, accountSecrets);
+    try {
+      await h.run('connect');
+      for (const stock of threeStocks) h.quote({ code: stock.code, price: 45000, changeRate: 1.25, receivedAt: 123 });
+      const monitor = h.profitMonitors.at(-1)!; monitor.received(sampleProfit);
+      const text = h.bar.text, tooltip = h.bar.tooltip, secrets = [...h.secrets.entries()];
+      const starts = h.starts(), stops = h.stops();
+      for (const position of ['left', 'right', 'left']) {
+        const old = h.bar;
+        h.configuration.position = position; h.change('position');
+        assert.equal(h.bar.alignment, position === 'left' ? 1 : 2);
+        assert.notEqual(h.bar, old); assert.equal(old.disposed, true);
+        assert.equal(h.bar.text, text); assert.equal(h.bar.tooltip, tooltip); assert.equal(h.bar.command, 'krStockMonitor.menu');
+        assert.equal(h.starts(), starts); assert.equal(h.stops(), stops); assert.equal(h.profitMonitors.at(-1), monitor);
+        assert.deepEqual([...h.secrets.entries()], secrets); assert.equal(h.configuration.displayMode, displayMode);
+        const count = h.bars.length; h.change('position'); assert.equal(h.bars.length, count);
+        assert.equal(h.bars.filter(bar => !bar.disposed).length, 1);
+      }
+      h.state({ kind: 'connecting', message: 'HTTPS KRX 조회 중' }); assert.equal(h.bar.text, text);
+      monitor.status('손익 갱신 지연'); assert.match(h.bar.tooltip, /손익 갱신 지연/);
+      h.state({ kind: 'error', message: 'HTTPS 조회 실패' }); assert.match(h.bar.text, /HTTPS 조회 실패/);
+      await h.run('disconnect'); assert.match(h.bar.text, /연결 안 됨/);
+    } finally { h.dispose(); assert.ok(h.bars.every(bar => bar.disposed)); }
+  }
+});
+
+test('invalid status bar positions show a configuration error and stop the existing connection', async () => {
+  for (const position of ['center', '', 1]) {
+    const h = environment();
+    try {
+      await h.run('connect'); const bar = h.bar, stops = h.stops();
+      h.configuration.position = position; h.change('position');
+      assert.equal(h.bar, bar); assert.ok(h.stops() > stops); assert.match(h.bar.text, /left 또는 right/);
+    } finally { h.dispose(); }
+  }
 });

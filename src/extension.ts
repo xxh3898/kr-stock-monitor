@@ -9,7 +9,7 @@ const PREFIX = 'krStockMonitor';
 let monitor: Monitor | undefined;
 
 class Monitor implements vscode.Disposable {
-  private readonly bar = vscode.window.createStatusBarItem('kr-stock-monitor', vscode.StatusBarAlignment.Right, 0);
+  private bar = vscode.window.createStatusBarItem('kr-stock-monitor', vscode.StatusBarAlignment.Right, 0);
   private readonly output = vscode.window.createOutputChannel('KR Stock Monitor');
   private readonly client: KisClient;
   private readonly tokens: KisTokenProvider;
@@ -93,6 +93,15 @@ class Monitor implements vscode.Disposable {
     this.rotation = undefined;
     try {
       const config = vscode.workspace.getConfiguration(PREFIX);
+      const position = config.get<string>('position', 'right');
+      if (position !== 'left' && position !== 'right') throw new Error('표시 위치는 left 또는 right로 설정하세요.');
+      const alignment = position === 'left' ? vscode.StatusBarAlignment.Left : vscode.StatusBarAlignment.Right;
+      if (this.bar.alignment !== alignment) {
+        const { id, name, command, priority } = this.bar;
+        this.bar.dispose();
+        this.bar = vscode.window.createStatusBarItem(id, alignment, priority);
+        this.bar.name = name; this.bar.command = command;
+      }
       const showProfit = config.get<boolean>('showProfit', false);
       if (typeof showProfit !== 'boolean') throw new Error('손익 표시 설정은 true 또는 false로 입력하세요.');
       this.showProfit = showProfit;
