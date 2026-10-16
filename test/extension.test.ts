@@ -21,6 +21,7 @@ function environment(initial: Record<string, unknown> = {}) {
   let failStore = false;
   let confirmDelete = false;
   const intervals: number[] = [];
+  let stateListener: (state: State) => void = () => {};
   let quoteListener: (quote: Quote) => void = () => {};
   const configuration: Record<string, unknown> = { stocks: [{ code: '204320', name: 'HL만도' }], rotationInterval: 5, ...initial };
   const change = (key = 'stocks') => configListener({ affectsConfiguration: (section: string) => section === 'krStockMonitor' || section === `krStockMonitor.${key}` });
@@ -56,6 +57,7 @@ function environment(initial: Record<string, unknown> = {}) {
     }
   };
   const kis = { createClient: (state: (value: State) => void, quote: (value: Quote) => void) => {
+    stateListener = state;
     quoteListener = quote;
     return {
       start(_stocks: unknown, seconds: number) {
@@ -82,7 +84,7 @@ function environment(initial: Record<string, unknown> = {}) {
     run: async (id: string) => { await commands.get(`krStockMonitor.${id}`)!(); await new Promise<void>(resolve => setImmediate(resolve)); },
     dispose: () => { extension.deactivate(); for (const item of context.subscriptions) item.dispose(); },
     starts: () => starts, stops: () => stops, passwords: () => passwords, failStore: () => { failStore = true; },
-    secretChanged: (key: string) => secretListener({ key }), intervals, confirmDeletion: () => { confirmDelete = true; }, change, quote: (value: Quote) => quoteListener(value) };
+    secretChanged: (key: string) => secretListener({ key }), intervals, confirmDeletion: () => { confirmDelete = true; }, change, state: (value: State) => stateListener(value), quote: (value: Quote) => quoteListener(value) };
 }
 
 test('activation is offline and demo is explicit; switching to real clears simulated prices', async () => {
@@ -140,6 +142,36 @@ test('all mode displays every stock, keeps pending symbols and updates each quot
     h.picks.push('표시 방식 선택', undefined); await h.run('menu');
     assert.equal(h.bar.text, text); assert.equal(h.starts(), 1);
   } finally { h.dispose(); }
+});
+
+test('polling keeps status bar text stable in both modes while tooltips and errors remain visible', async () => {
+  for (const displayMode of ['all', 'rotate']) {
+    const h = environment({ stocks: threeStocks, displayMode });
+    try {
+      h.secrets.set('kis.real.credentials.v1', 'synthetic-credentials');
+      await h.run('connect');
+      const pending = h.bar.text;
+      h.state({ kind: 'connecting', message: 'HTTPS KRX 조회 중' });
+      assert.equal(h.bar.text, pending);
+      assert.ok(h.bar.tooltip.includes('HTTPS KRX 조회 중'));
+      for (const stock of threeStocks) h.quote({ code: stock.code, price: 45000, changeRate: 1.25, receivedAt: 123 });
+      h.state({ kind: 'live', message: 'HTTPS 5초 주기 조회' });
+      const text = h.bar.text;
+      for (let cycle = 0; cycle < 3; cycle++) {
+        h.state({ kind: 'connecting', message: 'HTTPS KRX 조회 중' });
+        assert.equal(h.bar.text, text);
+        assert.ok(h.bar.tooltip.includes('HTTPS KRX 조회 중'));
+        h.state({ kind: 'live', message: 'HTTPS 5초 주기 조회' });
+        assert.equal(h.bar.text, text);
+        assert.ok(h.bar.tooltip.includes('HTTPS 5초 주기 조회'));
+      }
+      h.state({ kind: 'error', message: 'HTTPS 조회 실패' });
+      assert.equal(h.bar.text, `${text} · HTTPS 조회 실패`);
+      assert.ok(h.bar.tooltip.includes('HTTPS 조회 실패'));
+      await h.run('disconnect');
+      assert.ok(h.bar.text.includes('연결 안 됨'));
+    } finally { h.dispose(); }
+  }
 });
 
 test('both modes are reachable; rotation uses its interval and switching keeps live quotes without reconnecting', async t => {

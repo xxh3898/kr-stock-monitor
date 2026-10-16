@@ -218,7 +218,7 @@ class Monitor implements vscode.Disposable {
       return `${stock.name} ${quote ? formatQuote(quote) : '시세 대기'}`;
     }).join(' | ');
     const prefix = this.mode === 'demo' ? '[데모] ' : '[KRX · HTTPS] ';
-    const status = this.state.kind === 'live' && this.mode === 'real' ? '' : ` · ${this.state.message}`;
+    const status = this.mode === 'real' && (this.state.kind === 'live' || this.state.kind === 'connecting') ? '' : ` · ${this.state.message}`;
     this.bar.text = text ? `${prefix}${text}${status}` : `KR Stock · ${this.state.kind === 'error' ? this.state.message : '관심 종목 추가'}`;
     const rows = this.stocks.map(item => {
       const q = this.quotes.get(item.code);
